@@ -9,7 +9,7 @@ import re
 import sys
 import time
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 THINK_SECONDS = 2
 TYPE_DELAY = 0.015
 MAX_HISTORY = 50
@@ -36,7 +36,9 @@ def think():
         filled = progress // 4
         bar = "█" * filled + "░" * (25 - filled)
 
-        sys.stdout.write(f"\r[ChatEPT v0.3] [{bar}] {progress}% | {stage}    ")
+        sys.stdout.write(
+            f"\r[ChatEPT v{VERSION}] [{bar}] {progress}% | {stage}    "
+        )
         sys.stdout.flush()
         time.sleep(THINK_SECONDS / len(stages))
 
@@ -111,6 +113,13 @@ def safe_calculate(expression):
         return None
 
 
+def has_phrase(clean_text, phrases):
+    for phrase in phrases:
+        if re.search(rf"\b{re.escape(phrase)}\b", clean_text):
+            return True
+    return False
+
+
 class ChatMemory:
 
     def __init__(self):
@@ -144,13 +153,11 @@ class ChatMemory:
             print(f"[ПОМИЛКА ЗБЕРЕЖЕННЯ ПАМ'ЯТІ]: {e}")
 
     def remember(self, user, bot):
-        self.history.append(
-            {
-                "user": user,
-                "bot": bot,
-                "time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        )
+        self.history.append({
+            "user": user,
+            "bot": bot,
+            "time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
         self.save_to_disk()
 
     def clear(self):
@@ -168,7 +175,7 @@ class ChatEPT:
 
         self.greetings = [
             "Привіт! Радий бачити тебе знову в TAURIVON!",
-            "Вітаю! ChatEPT v0.3 до твоїх послуг.",
+            f"Вітаю! ChatEPT v{VERSION} до твоїх послуг.",
             "Здоров! Пам'ять завантажено, готовий до роботи.",
         ]
 
@@ -180,21 +187,39 @@ class ChatEPT:
 
     def respond(self, message):
         text = message.lower().strip()
-        clean = re.sub(r"[^\w\s]", "", text)
-        clean = re.sub(r"\s+", " ", clean)
+        clean = re.sub(r"[^\w\s']", "", text)
+        clean = re.sub(r"\s+", " ", clean).strip()
 
-        if any(
-            x in clean
-            for x in [
+        if has_phrase(
+            clean, ["детальніше", "розкажи більше", "докладніше", "що ще"]
+        ):
+            if self.memory.last_topic == "taurivon":
+                return (
+                    "У межах TAURIVON ми розвиваємо кілька напрямків: локальний ШІ ChatEPT, "
+                    "систему захисту Security Hub та утиліту TAURIVON Calc. Більше на taurivon.cloud-ip.cc!"
+                )
+            if self.memory.last_topic == "creator":
+                return (
+                    "Єгор Дерій заснував TAURIVON, щоб пройти шлях від власних утиліт "
+                    "до повноцінної технологічної компанії у 6 етапів."
+                )
+            if self.memory.last_topic == "identity":
+                return (
+                    "Я працюю локально на Python, зберігаю історію розмов у JSON "
+                    "та вмію безпечно обчислювати математичні вирази."
+                )
+
+        if has_phrase(
+            clean,
+            [
                 "я тебе створив",
                 "я тебе зробив",
                 "це я тебе створив",
                 "я твій творець",
                 "я твій розробник",
-            ]
+            ],
         ):
             self.memory.last_topic = "creator"
-            self.memory.save_to_disk()
             return (
                 "Звісно! Ти — Єгор Дерій, мій творець і розробник! "
                 "Пам'ятаю це назавжди. ♉"
@@ -209,12 +234,11 @@ class ChatEPT:
             name = name_match.group(1).capitalize()
             self.memory.username = name
             self.memory.last_topic = "name"
-            self.memory.save_to_disk()
             return f"Запам'ятав! Тепер я знаю, що тебе звати {name}."
 
-        if any(
-            x in clean
-            for x in [
+        if has_phrase(
+            clean,
+            [
                 "привіт",
                 "вітаю",
                 "здоров",
@@ -223,75 +247,91 @@ class ChatEPT:
                 "доброго ранку",
                 "hello",
                 "hi",
-            ]
+            ],
         ):
             self.memory.last_topic = "greeting"
-            return random.choice(self.greetings)
+            greeting = random.choice(self.greetings)
+            if self.memory.username:
+                return f"{greeting} Радий знову спілкуватися, {self.memory.username}!"
+            return greeting
 
-        if any(
-            x in clean
-            for x in ["як тебе звати", "хто ти", "що ти таке", "представся"]
+        if has_phrase(
+            clean, ["як тебе звати", "хто ти", "що ти таке", "представся"]
         ):
             self.memory.last_topic = "identity"
             return (
-                f"Я ChatEPT v{VERSION} — локальна нейромережа з постійною"
-                " пам'яттю від TAURIVON Software!"
+                f"Я ChatEPT v{VERSION} — локальний інтелектуальний асистент із постійною "
+                "пам'яттю від TAURIVON Software!"
             )
 
-        if any(
-            x in clean
-            for x in [
+        if has_phrase(
+            clean,
+            [
                 "хто тебе створив",
                 "хто твій автор",
                 "хто тебе зробив",
                 "хто розробник",
-            ]
+            ],
         ):
             self.memory.last_topic = "creator"
             return (
-                "Мене створив Єгор Дерій — засновник технологічної екосистеми"
-                " TAURIVON."
+                "Мене створив Єгор Дерій — засновник технологічної екосистеми "
+                "TAURIVON."
             )
 
-        if any(
-            x in clean
-            for x in ["як мене звати", "пам'ятаєш моє ім'я", "ти пам'ятаєш моє ім'я"]
+        if has_phrase(
+            clean,
+            [
+                "як мене звати",
+                "пам'ятаєш моє ім'я",
+                "ти пам'ятаєш моє ім'я",
+                "хто я",
+            ],
         ):
             if self.memory.username:
                 return (
-                    f"Звичайно! У моїй пам'яті записано, що тебе звати"
-                    f" {self.memory.username}."
+                    f"Звичайно! У моїй пам'яті записано, що тебе звати "
+                    f"{self.memory.username}."
                 )
             return "Ти ще не назвав свого імені. Скажи: «Мене звати ...»"
 
-        if "taurivon" in clean or "тауривон" in clean:
+        if has_phrase(clean, ["taurivon", "тауривон"]):
             self.memory.last_topic = "taurivon"
             return (
-                "TAURIVON — це наша екосистема (taurivon.cloud-ip.cc), де ми"
-                " створюємо власний якісний софт!"
+                "TAURIVON — це наша екосистема (taurivon.cloud-ip.cc), де ми "
+                "створюємо власний якісний софт!"
             )
 
-        if any(x in clean for x in ["як справи", "як ти", "що робиш"]):
+        if has_phrase(clean, ["як справи", "як ти", "що робиш"]):
             self.memory.last_topic = "mood"
             return (
-                "Усе чудово! База пам'яті синхронізована, готові створювати нові"
-                " проєкти."
+                "Усе чудово! База пам'яті синхронізована, готові створювати нові "
+                "проєкти."
             )
 
-        if any(x in clean for x in ["дякую", "спасибі"]):
+        if has_phrase(clean, ["дякую", "спасибі"]):
             return "Будь ласка! Завжди радий допомогти в TAURIVON."
 
-        if "час" in clean or "година" in clean:
+        if has_phrase(clean, ["час", "година", "котра година"]):
             return "Зараз " + dt.datetime.now().strftime("%H:%M:%S")
-        if "дата" in clean or "число сьогодні" in clean:
+
+        if has_phrase(clean, ["дата", "число сьогодні", "яке сьогодні число"]):
             return dt.datetime.now().strftime("Сьогодні %d.%m.%Y")
 
         math_text = re.sub(
             r"^(скільки буде|порахуй|обчисли)\s*", "", text
         ).replace(",", ".")
-        if re.fullmatch(r"[\d\s.+*/()%\-]+", math_text):
+        is_date = re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{2,4}", math_text.strip())
+        has_operator = re.search(r"[+\-*/%]", math_text)
+
+        if (
+            not is_date
+            and has_operator
+            and re.fullmatch(r"[\d\s.+*/()%\-]+", math_text)
+        ):
             result = safe_calculate(math_text)
             if result is not None:
+                self.memory.last_topic = "math"
                 return f"Результат обчислення: {result}"
             return "Не вдалося обчислити вираз."
 
@@ -299,15 +339,15 @@ class ChatEPT:
 
 
 def show_help():
-    print("""
-========== CHAT EPT v0.3 HELP ==========
+    print(f"""
+========== CHAT EPT v{VERSION} HELP ==========
 /help       - список команд
 /history    - переглянути всю постійну історію
 /clear      - стерти пам'ять і файл збереження
 /time       - поточний час
 /about      - інформація про версію
 /exit       - вийти з програми
-========================================
+==========================================
 """)
 
 
@@ -339,7 +379,12 @@ def chatept_bot():
     )
     print("Напиши /help для довідки, /exit для виходу.\n")
 
-    print_slow("ChatEPT: Вітаю! Я готовий до роботи. ♉")
+    welcome_msg = (
+        f"Вітаю, {bot.memory.username}! Я готовий до роботи. ♉"
+        if bot.memory.username
+        else "Вітаю! Я готовий до роботи. ♉"
+    )
+    print_slow(f"ChatEPT: {welcome_msg}")
 
     while True:
         try:
