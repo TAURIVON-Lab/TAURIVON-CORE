@@ -1,25 +1,43 @@
-import sys
-import subprocess
-import tempfile
+from __future__ import annotations
+
+import codecs
 import os
 import re
 import shutil
+import sys
+import tempfile
 import webbrowser
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPlainTextEdit, QPushButton, QFileDialog, QSplitter, QLabel,
-    QComboBox, QTabWidget, QMessageBox, QTextEdit, QLineEdit, QCompleter,
-    QTreeView, QFileSystemModel, QInputDialog, QStatusBar
+from pathlib import Path
+
+from PySide6.QtCore import (
+    QDir, QModelIndex, QProcess, QProcessEnvironment, QRect, QSize, Qt, QTimer
 )
 from PySide6.QtGui import (
-    QFont, QKeySequence, QShortcut, QSyntaxHighlighter, QTextCharFormat,
-    QColor, QPainter, QTextFormat, QTextCursor, QIcon
+    QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPainter, QShortcut,
+    QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextFormat
 )
-from PySide6.QtCore import Qt, QRect, QSize, QStringListModel, QDir, QModelIndex
+from PySide6.QtWidgets import (
+    QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QSplitter, QStatusBar, QTabWidget, QTextEdit, QTreeView, QVBoxLayout,
+    QWidget
+)
+
+# У PySide6 (Qt 6) QFileSystemModel знаходиться в QtGui, у старіших збірках — у QtWidgets.
+try:
+    from PySide6.QtGui import QFileSystemModel
+except ImportError:  # pragma: no cover
+    from PySide6.QtWidgets import QFileSystemModel
+
+# Необов'язкова залежність: видалення у кошик (pip install send2trash).
+try:
+    from send2trash import send2trash
+except ImportError:  # pragma: no cover
+    send2trash = None
 
 
 APP_NAME = "TAURIVON Coder"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 
 
 def resource_path(relative_path: str) -> str:
@@ -28,14 +46,39 @@ def resource_path(relative_path: str) -> str:
     return os.path.join(base_path, relative_path)
 
 
+def norm(path: str) -> str:
+    """Нормалізований шлях для порівнянь (регістр на Windows, слеші, відносні шляхи)."""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def path_inside(child: str, parent: str) -> bool:
+    c, p = norm(child), norm(parent)
+    return c == p or c.startswith(p + os.sep)
+
+
+LANG_PY = "Python (.py)"
+LANG_HTML = "HTML (.html)"
+LANG_CSS = "CSS (.css)"
+LANG_JS = "JavaScript (.js)"
+LANG_CPP = "C++ (.cpp)"
+LANG_TXT = "Текст (.txt)"
+
 LANG_EXTENSIONS = {
-    "Python (.py)": ".py",
-    "HTML (.html)": ".html",
-    "CSS (.css)": ".css",
-    "JavaScript (.js)": ".js",
-    "C++ (.cpp)": ".cpp",
-    "Текст (.txt)": ".txt"
+    LANG_PY: ".py",
+    LANG_HTML: ".html",
+    LANG_CSS: ".css",
+    LANG_JS: ".js",
+    LANG_CPP: ".cpp",
+    LANG_TXT: ".txt",
 }
+
+
+def detect_language(path: str) -> str | None:
+    ext = os.path.splitext(path)[1].lower()
+    for name, lang_ext in LANG_EXTENSIONS.items():
+        if lang_ext == ext:
+            return name
+    return None
 
 
 # Типи файлів, які безпечно показувати в редакторі як текстові файли проєкту.
@@ -57,46 +100,108 @@ PROJECT_IGNORED_DIRS = {
     ".ruff_cache", ".venv", "venv", "env", "node_modules", "site-packages",
     "dist", "build", "out", "target", "coverage", "vendor", ".next", ".nuxt"
 }
-MAX_PROJECT_TEXT_FILE_SIZE = 2 * 1024 * 1024  # Не завантажуємо в редактор файли понад 2 МБ.
+MAX_PROJECT_TEXT_FILE_SIZE = 2 * 1024 * 1024  # Файли понад 2 МБ в редактор не завантажуємо.
+MAX_AUTO_OPEN_FILES = 30                      # Скільки файлів відкривати автоматично при старті.
 
 
-COMPLETION_WORDS = {
-    "Python (.py)": sorted({
-        "def", "class", "return", "if", "elif", "else", "for", "while", "break",
-        "continue", "import", "from", "as", "try", "except", "finally", "with",
-        "pass", "True", "False", "None", "and", "or", "not", "in", "is", "lambda",
-        "async", "await", "yield", "print", "len", "range", "int", "str", "float",
-        "list", "dict", "set", "tuple", "open", "input", "type", "enumerate",
-        "zip", "isinstance", "__init__", "self"
-    }),
-    "HTML (.html)": sorted([
-        "!DOCTYPE", "html", "head", "meta", "title", "link", "script", "style",
-        "body", "header", "nav", "main", "section", "article", "footer",
-        "div", "span", "p", "a", "h1", "h2", "h3", "ul", "ol", "li",
-        "button", "input", "form", "label", "img", "table", "tr", "td", "th"
-    ]),
-    "CSS (.css)": sorted([
-        "background", "background-color", "color", "font-size", "font-family",
-        "font-weight", "margin", "margin-top", "margin-bottom", "padding",
-        "border", "border-radius", "display", "flex", "grid", "align-items",
-        "justify-content", "gap", "width", "height", "max-width", "position",
-        "hover", "active", "cursor", "pointer", "box-shadow", "transition"
-    ]),
-    "JavaScript (.js)": sorted([
-        "const", "let", "var", "function", "return", "if", "else", "for", "while",
-        "switch", "case", "break", "import", "export", "from", "default", "class",
-        "new", "try", "catch", "finally", "async", "await", "true", "false",
-        "null", "undefined", "console.log", "document", "window", "addEventListener",
-        "querySelector"
-    ]),
-    "C++ (.cpp)": sorted([
-        "#include", "<iostream>", "<vector>", "<string>", "int", "float",
-        "double", "char", "bool", "void", "return", "if", "else", "for",
-        "while", "do", "switch", "case", "break", "continue", "class", "struct",
-        "public", "private", "protected", "namespace", "std", "cout", "cin",
-        "endl", "true", "false", "nullptr", "const"
-    ]),
-    "Текст (.txt)": []
+# ---------------------------------------------------------------------------
+# Шрифти
+# ---------------------------------------------------------------------------
+
+_MONO_FAMILY: str | None = None
+
+
+def mono_font(size: int) -> QFont:
+    """Моноширинний шрифт: Consolas, а якщо його немає — найкращий доступний."""
+    global _MONO_FAMILY
+    if _MONO_FAMILY is None:
+        families = set(QFontDatabase.families())
+        for name in ("Consolas", "Cascadia Mono", "JetBrains Mono",
+                     "DejaVu Sans Mono", "Menlo", "Monaco", "Courier New"):
+            if name in families:
+                _MONO_FAMILY = name
+                break
+        else:
+            _MONO_FAMILY = QFontDatabase.systemFont(QFontDatabase.FixedFont).family()
+    font = QFont(_MONO_FAMILY, size)
+    font.setStyleHint(QFont.Monospace)
+    return font
+
+
+# ---------------------------------------------------------------------------
+# Читання / запис файлів зі збереженням кодування та переносів рядків
+# ---------------------------------------------------------------------------
+
+def read_text_file(path: str) -> tuple[str, str, str]:
+    """Повертає (текст з \\n, кодування, стиль переносу рядків)."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    newline = "\r\n" if b"\r\n" in raw else "\n"
+    encoding = "utf-8-sig" if raw.startswith(codecs.BOM_UTF8) else "utf-8"
+    try:
+        text = raw.decode(encoding)
+    except UnicodeDecodeError:
+        encoding = "cp1251"
+        text = raw.decode(encoding, errors="replace")
+    return text.replace("\r\n", "\n"), encoding, newline
+
+
+class SmartDecoder:
+    """Декодує вивід процесу: спочатку UTF-8, а якщо не вийшло — запасне кодування (OEM на Windows)."""
+
+    def __init__(self, fallback: str):
+        self.fallback = fallback
+        self._utf8 = codecs.getincrementaldecoder("utf-8")("strict")
+
+    def decode(self, data: bytes, final: bool = False) -> str:
+        try:
+            return self._utf8.decode(data, final)
+        except UnicodeDecodeError:
+            self._utf8.reset()
+            return data.decode(self.fallback, errors="replace")
+
+
+def oem_encoding() -> str:
+    if os.name == "nt":
+        try:
+            import ctypes
+            name = f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+            codecs.lookup(name)
+            return name
+        except Exception:
+            return "cp866"
+    return "utf-8"
+
+
+# ---------------------------------------------------------------------------
+# Підсвітка синтаксису
+# ---------------------------------------------------------------------------
+
+COMPLETION_NOTE = "Автодоповнення та автозакриття свідомо вимкнені: код вводиться буквально."
+
+_STR_CODE = r"""(?P<string>"(?:\\.|[^"\\\n])*"?|'(?:\\.|[^'\\\n])*'?)"""
+_STR_STRICT = r"""(?P<string>"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')"""
+
+
+def _scan_cfg(single: str | None, multiline: list) -> dict:
+    return {
+        "single": re.compile(single) if single else None,
+        "ml": multiline,
+        "states": {item[2]: item for item in multiline},
+    }
+
+
+# multiline: (початок, кінець, номер стану блока, вид форматування)
+SCAN_CFG = {
+    LANG_PY: _scan_cfg(r"(?P<comment>#.*)|" + _STR_CODE,
+                       [('"""', '"""', 1, "string"), ("'''", "'''", 2, "string")]),
+    LANG_HTML: _scan_cfg(_STR_STRICT, [("<!--", "-->", 5, "comment")]),
+    LANG_CSS: _scan_cfg(_STR_STRICT, [("/*", "*/", 3, "comment")]),
+    LANG_JS: _scan_cfg(r"(?P<comment>//.*)|" + _STR_CODE,
+                       [("/*", "*/", 3, "comment"), ("`", "`", 4, "string")]),
+    LANG_CPP: _scan_cfg(r"(?P<comment>//.*)|" + _STR_CODE,
+                        [("/*", "*/", 3, "comment")]),
+    LANG_TXT: _scan_cfg(_STR_STRICT, []),
 }
 
 
@@ -110,33 +215,40 @@ def make_format(color_hex: str, bold: bool = False, italic: bool = False) -> QTe
     return fmt
 
 
+def _words_re(words) -> re.Pattern:
+    return re.compile(r"\b(?:" + "|".join(re.escape(w) for w in sorted(words)) + r")\b")
+
+
+NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
+
+PYTHON_KEYWORDS = {
+    "def", "class", "return", "if", "elif", "else", "for", "while", "break",
+    "continue", "import", "from", "as", "try", "except", "finally", "with",
+    "pass", "True", "False", "None", "and", "or", "not", "in", "is", "lambda",
+    "async", "await", "yield", "raise", "global", "nonlocal", "del", "assert"
+}
+PYTHON_BUILTINS = {
+    "print", "len", "range", "int", "str", "float", "list", "dict", "set",
+    "tuple", "open", "input", "type", "enumerate", "zip", "isinstance", "self"
+}
+JS_KEYWORDS = {
+    "const", "let", "var", "function", "return", "if", "else", "for", "while",
+    "switch", "case", "break", "import", "export", "from", "default", "class",
+    "new", "try", "catch", "finally", "async", "await", "true", "false", "null",
+    "undefined", "this", "continue"
+}
+CPP_KEYWORDS = {
+    "int", "float", "double", "char", "bool", "void", "return", "if", "else",
+    "for", "while", "do", "switch", "case", "break", "continue", "class",
+    "struct", "public", "private", "protected", "namespace", "using", "include",
+    "true", "false", "nullptr", "const", "auto"
+}
+
+
 class UniversalHighlighter(QSyntaxHighlighter):
-    """Підсвічувач синтаксису для Python, HTML, CSS, JS, C++ та загального коду."""
+    """Підсвічувач для Python, HTML, CSS, JS, C++ з підтримкою багаторядкових рядків і коментарів."""
 
-    PYTHON_KEYWORDS = {
-        "def", "class", "return", "if", "elif", "else", "for", "while", "break",
-        "continue", "import", "from", "as", "try", "except", "finally", "with",
-        "pass", "True", "False", "None", "and", "or", "not", "in", "is", "lambda",
-        "async", "await", "yield"
-    }
-    PYTHON_BUILTINS = {
-        "print", "len", "range", "int", "str", "float", "list", "dict", "set",
-        "tuple", "open", "input", "type", "enumerate", "zip", "isinstance"
-    }
-    JS_KEYWORDS = {
-        "const", "let", "var", "function", "return", "if", "else", "for", "while",
-        "switch", "case", "break", "import", "export", "from", "default", "class",
-        "new", "try", "catch", "finally", "async", "await", "true", "false", "null",
-        "undefined"
-    }
-    CPP_KEYWORDS = {
-        "int", "float", "double", "char", "bool", "void", "return", "if", "else",
-        "for", "while", "do", "switch", "case", "break", "continue", "class",
-        "struct", "public", "private", "protected", "namespace", "using", "include",
-        "true", "false", "nullptr", "const"
-    }
-
-    def __init__(self, document, lang_name: str = "Python (.py)"):
+    def __init__(self, document, lang_name: str = LANG_PY):
         super().__init__(document)
         self.lang_name = lang_name
 
@@ -151,69 +263,110 @@ class UniversalHighlighter(QSyntaxHighlighter):
         self.fmt_css_val = make_format("#a5d6ff")
         self.fmt_selector = make_format("#ffa657", bold=True)
 
+        # Правила «базового» підсвічування (виконуються до рядків і коментарів,
+        # які потім перекривають їх зверху). Усі регулярні вирази скомпільовані один раз.
+        self._rules = {
+            LANG_PY: [
+                (_words_re(PYTHON_KEYWORDS), self.fmt_keyword, 0),
+                (_words_re(PYTHON_BUILTINS), self.fmt_builtin, 0),
+                (NUMBER_RE, self.fmt_number, 0),
+            ],
+            LANG_JS: [
+                (_words_re(JS_KEYWORDS), self.fmt_keyword, 0),
+                (NUMBER_RE, self.fmt_number, 0),
+            ],
+            LANG_CPP: [
+                (_words_re(CPP_KEYWORDS), self.fmt_keyword, 0),
+                (re.compile(r"#\s*\w+"), self.fmt_builtin, 0),
+                (NUMBER_RE, self.fmt_number, 0),
+            ],
+            LANG_HTML: [
+                (re.compile(r"</?\s*[\w!-]+"), self.fmt_tag, 0),
+                (re.compile(r"/?>"), self.fmt_tag, 0),
+                (re.compile(r"\b([\w:-]+)\s*="), self.fmt_attr, 1),
+            ],
+            LANG_CSS: [
+                (re.compile(r"([\w-]+)\s*:"), self.fmt_css_prop, 1),
+                (re.compile(r":\s*([^;{}]+)"), self.fmt_css_val, 1),
+                (re.compile(r"#(?:[0-9a-fA-F]{3,8})\b"), self.fmt_number, 0),
+                (re.compile(r"^\s*([^{}/\n]+?)\s*\{"), self.fmt_selector, 1),
+            ],
+            LANG_TXT: [(NUMBER_RE, self.fmt_number, 0)],
+        }
+
     def set_language(self, lang_name: str):
         self.lang_name = lang_name
         self.rehighlight()
 
-    def _highlight_words(self, text: str, words: set, fmt: QTextCharFormat):
-        if not words:
-            return
-        pattern = r"\b(" + "|".join(re.escape(w) for w in words) + r")\b"
-        for match in re.finditer(pattern, text):
-            self.setFormat(match.start(), match.end() - match.start(), fmt)
-
-    def _highlight_regex(self, text: str, pattern: str, fmt: QTextCharFormat, group: int = 0):
-        for match in re.finditer(pattern, text):
-            start, end = match.span(group)
-            if start >= 0 and end > start:
-                self.setFormat(start, end - start, fmt)
+    def _fmt_for(self, kind: str) -> QTextCharFormat:
+        return self.fmt_comment if kind == "comment" else self.fmt_string
 
     def highlightBlock(self, text: str):
-        if not text:
-            return
+        self.setCurrentBlockState(0)
+        lang = self.lang_name
+        cfg = SCAN_CFG.get(lang, SCAN_CFG[LANG_TXT])
+        prev_state = self.previousBlockState()
+        n = len(text)
 
-        if self.lang_name == "Python (.py)":
-            self._highlight_words(text, self.PYTHON_KEYWORDS, self.fmt_keyword)
-            self._highlight_words(text, self.PYTHON_BUILTINS, self.fmt_builtin)
-            self._highlight_regex(text, r"\b\d+(\.\d+)?\b", self.fmt_number)
-            self._highlight_regex(text, r"(\".*?\"|'.*?')", self.fmt_string)
-            self._highlight_regex(text, r"#.*$", self.fmt_comment)
+        # 1) Базові правила (ключові слова, числа, теги…).
+        if text:
+            for regex, fmt, group in self._rules.get(lang, ()):
+                for m in regex.finditer(text):
+                    start, end = m.span(group)
+                    if end > start:
+                        self.setFormat(start, end - start, fmt)
 
-        elif self.lang_name == "HTML (.html)":
-            self._highlight_regex(text, r"</?\s*[\w-]+", self.fmt_tag)
-            self._highlight_regex(text, r"/?>", self.fmt_tag)
-            self._highlight_regex(text, r"\b([\w-]+)\s*=", self.fmt_attr, group=1)
-            self._highlight_regex(text, r"(\".*?\"|'.*?')", self.fmt_string)
-            self._highlight_regex(text, r"<!--.*?-->", self.fmt_comment)
+        # 2) Рядки та коментарі зліва направо — перший збіг виграє і перекриває базові правила.
+        pos = 0
+        if prev_state > 0 and prev_state in cfg["states"]:
+            _, close, state, kind = cfg["states"][prev_state]
+            end = text.find(close)
+            if end == -1:
+                self.setFormat(0, n, self._fmt_for(kind))
+                self.setCurrentBlockState(state)
+                return
+            pos = end + len(close)
+            self.setFormat(0, pos, self._fmt_for(kind))
 
-        elif self.lang_name == "CSS (.css)":
-            self._highlight_regex(text, r"^([^{}/]+)\{", self.fmt_selector, group=1)
-            self._highlight_regex(text, r"([\w-]+)\s*:", self.fmt_css_prop, group=1)
-            self._highlight_regex(text, r":\s*([^;{}]+)", self.fmt_css_val, group=1)
-            self._highlight_regex(text, r"#(?:[0-9a-fA-F]{3,8})\b", self.fmt_number)
-            self._highlight_regex(text, r"/\*.*?\*/", self.fmt_comment)
+        single = cfg["single"]
+        while pos < n:
+            best = None  # (позиція, "single"/"ml", дані)
+            if single:
+                m = single.search(text, pos)
+                if m:
+                    best = (m.start(), "single", m)
+            for definition in cfg["ml"]:
+                i = text.find(definition[0], pos)
+                if i != -1 and (best is None or i <= best[0]):
+                    best = (i, "ml", definition)
+            if best is None:
+                break
 
-        elif self.lang_name == "JavaScript (.js)":
-            self._highlight_words(text, self.JS_KEYWORDS, self.fmt_keyword)
-            self._highlight_regex(text, r"\b\d+(\.\d+)?\b", self.fmt_number)
-            self._highlight_regex(text, r"(`.*?`|\".*?\"|'.*?')", self.fmt_string)
-            self._highlight_regex(text, r"//.*$", self.fmt_comment)
+            if best[1] == "single":
+                m = best[2]
+                kind = "comment" if m.lastgroup == "comment" else "string"
+                self.setFormat(m.start(), m.end() - m.start(), self._fmt_for(kind))
+                pos = m.end() if m.end() > pos else pos + 1
+            else:
+                opener, closer, state, kind = best[2]
+                start = best[0]
+                end = text.find(closer, start + len(opener))
+                if end == -1:
+                    self.setFormat(start, n - start, self._fmt_for(kind))
+                    self.setCurrentBlockState(state)
+                    return
+                stop = end + len(closer)
+                self.setFormat(start, stop - start, self._fmt_for(kind))
+                pos = stop
 
-        elif self.lang_name == "C++ (.cpp)":
-            self._highlight_words(text, self.CPP_KEYWORDS, self.fmt_keyword)
-            self._highlight_regex(text, r"#\s*\w+", self.fmt_builtin)
-            self._highlight_regex(text, r"\b\d+(\.\d+)?\b", self.fmt_number)
-            self._highlight_regex(text, r"(\".*?\"|'.*?')", self.fmt_string)
-            self._highlight_regex(text, r"//.*$", self.fmt_comment)
 
-        else:
-            self._highlight_regex(text, r"\b\d+(\.\d+)?\b", self.fmt_number)
-            self._highlight_regex(text, r"(\".*?\"|'.*?')", self.fmt_string)
-            self._highlight_regex(text, r"(#.*$|//.*$)", self.fmt_comment)
-
+# ---------------------------------------------------------------------------
+# Редактор
+# ---------------------------------------------------------------------------
 
 class LineNumberArea(QWidget):
     """Ліва колонка з номерами рядків для EditorTab."""
+
     def __init__(self, editor):
         super().__init__(editor)
         self.code_editor = editor
@@ -226,29 +379,18 @@ class LineNumberArea(QWidget):
 
 
 class EditorTab(QPlainTextEdit):
-    """Окрема вкладка редактора з номерами рядків, підсвіткою, автодоповненням та мовою."""
+    """Вкладка редактора: номери рядків, підсвітка, відступи. Код вводиться буквально."""
 
-    PAIRS = {
-        "(": ")",
-        "[": "]",
-        "{": "}",
-        '"': '"',
-        "'": "'",
-        "`": "`",
-    }
-    CLOSING_CHARS = set(PAIRS.values())
-    SELF_CLOSING_HTML_TAGS = {
-        "area", "base", "br", "col", "embed", "hr", "img", "input",
-        "link", "meta", "param", "source", "track", "wbr", "!DOCTYPE"
-    }
-
-    def __init__(self, lang_name="Python (.py)", file_path=None, content="", font_size=13):
+    def __init__(self, lang_name=LANG_PY, file_path=None, content="", font_size=13,
+                 encoding="utf-8", newline=None):
         super().__init__()
         self.lang_name = lang_name
         self.file_path = file_path
+        self.encoding = encoding
+        self.newline = newline or os.linesep
         self.is_modified = False
 
-        self.setFont(QFont("Consolas", font_size))
+        self.setFont(mono_font(font_size))
         self.line_number_area = LineNumberArea(self)
 
         self.blockCountChanged.connect(self.update_line_number_area_width)
@@ -256,13 +398,6 @@ class EditorTab(QPlainTextEdit):
         self.cursorPositionChanged.connect(self.highlight_current_line)
 
         self.highlighter = UniversalHighlighter(self.document(), self.lang_name)
-
-        self.completer = QCompleter(self)
-        self.completer.setWidget(self)
-        self.completer.setCompletionMode(QCompleter.PopupCompletion)
-        self.completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self.completer.activated.connect(self.insert_completion)
-        self._update_completer_model()
 
         self.setPlainText(content)
         self.textChanged.connect(self._on_text_changed)
@@ -277,51 +412,8 @@ class EditorTab(QPlainTextEdit):
         self.update_line_number_area_width(0)
         self.line_number_area.update()
 
-    def _update_completer_model(self):
-        words = COMPLETION_WORDS.get(self.lang_name, [])
-        self.completer.setModel(QStringListModel(words, self.completer))
-
-    def word_under_cursor(self) -> str:
-        cursor = self.textCursor()
-        cursor.select(QTextCursor.WordUnderCursor)
-        return cursor.selectedText()
-
-    def insert_completion(self, completion: str):
-        cursor = self.textCursor()
-        prefix = self.completer.completionPrefix()
-        extra = len(completion) - len(prefix)
-        if extra > 0:
-            cursor.insertText(completion[-extra:])
-        self.setTextCursor(cursor)
-
-    def _auto_close_html_tag(self, cursor: QTextCursor):
-        if self.lang_name != "HTML (.html)":
-            return False
-
-        line_before = cursor.block().text()[:cursor.positionInBlock()]
-        if line_before.endswith("-->") or re.search(r"</[\w-]+\s*>$", line_before):
-            return False
-
-        match = re.search(r"<([\w!-]+)(?:\s[^<>]*)?>$", line_before)
-        if not match:
-            return False
-
-        tag_name = match.group(1)
-        if tag_name.lower() in self.SELF_CLOSING_HTML_TAGS or tag_name.startswith("!"):
-            return False
-
-        line_after = cursor.block().text()[cursor.positionInBlock():]
-        closing = f"</{tag_name}>"
-        if line_after.startswith(closing):
-            return False
-
-        cursor.insertText(">" + closing)
-        cursor.movePosition(QTextCursor.Left, QTextCursor.MoveAnchor, len(closing))
-        self.setTextCursor(cursor)
-        return True
-
     def keyPressEvent(self, event):
-        """Ручне введення без автодоповнення та автоматичної вставки символів."""
+        """Тільки Tab / Shift+Tab; усе інше вводиться буквально, без автододавання символів."""
         if event.key() == Qt.Key_Tab:
             cursor = self.textCursor()
             if cursor.hasSelection():
@@ -334,19 +426,12 @@ class EditorTab(QPlainTextEdit):
             self._indent_selection(unindent=True)
             return
 
-        # Решта клавіш вводиться буквально: без шаблонів,
-        # автозакриття тегів, дужок, лапок чи автоматичних відступів.
-        if self.completer.popup().isVisible():
-            self.completer.popup().hide()
         super().keyPressEvent(event)
 
     def _indent_selection(self, unindent: bool = False):
         cursor = self.textCursor()
-        start = cursor.selectionStart()
-        end = cursor.selectionEnd()
-
-        start_block = self.document().findBlock(start)
-        end_block = self.document().findBlock(end)
+        start_block = self.document().findBlock(cursor.selectionStart())
+        end_block = self.document().findBlock(cursor.selectionEnd())
 
         cursor.beginEditBlock()
         block = start_block
@@ -368,33 +453,9 @@ class EditorTab(QPlainTextEdit):
             block = block.next()
         cursor.endEditBlock()
 
-    def _trigger_word_completer(self):
-        words = COMPLETION_WORDS.get(self.lang_name, [])
-        if not words:
-            self.completer.popup().hide()
-            return
-
-        prefix = self.word_under_cursor()
-        if len(prefix) < 2:
-            self.completer.popup().hide()
-            return
-
-        if prefix != self.completer.completionPrefix():
-            self.completer.setCompletionPrefix(prefix)
-            self.completer.popup().setCurrentIndex(self.completer.completionModel().index(0, 0))
-
-        rect = self.cursorRect()
-        rect.setWidth(
-            self.completer.popup().sizeHintForColumn(0)
-            + self.completer.popup().verticalScrollBar().sizeHint().width()
-            + 20
-        )
-        self.completer.complete(rect)
-
     def line_number_area_width(self) -> int:
         digits = max(2, len(str(max(1, self.blockCount()))))
-        space = 14 + self.fontMetrics().horizontalAdvance("9") * digits
-        return space
+        return 14 + self.fontMetrics().horizontalAdvance("9") * digits
 
     def update_line_number_area_width(self, _):
         self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
@@ -437,18 +498,13 @@ class EditorTab(QPlainTextEdit):
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
-                number_text = str(block_number + 1)
-                if block_number == current_block_number:
-                    painter.setPen(QColor("#ffffff"))
-                else:
-                    painter.setPen(QColor("#6e7681"))
-
+                painter.setPen(QColor("#ffffff" if block_number == current_block_number else "#6e7681"))
                 painter.drawText(
                     0, top,
                     self.line_number_area.width() - 8,
                     self.fontMetrics().height(),
                     Qt.AlignRight | Qt.AlignVCenter,
-                    number_text
+                    str(block_number + 1)
                 )
 
             block = block.next()
@@ -460,8 +516,7 @@ class EditorTab(QPlainTextEdit):
         extra_selections = []
         if not self.isReadOnly():
             selection = QTextEdit.ExtraSelection()
-            line_color = QColor("#1e2330")
-            selection.format.setBackground(line_color)
+            selection.format.setBackground(QColor("#1e2330"))
             selection.format.setProperty(QTextFormat.FullWidthSelection, True)
             selection.cursor = self.textCursor()
             selection.cursor.clearSelection()
@@ -471,29 +526,33 @@ class EditorTab(QPlainTextEdit):
     def set_language(self, lang_name: str):
         self.lang_name = lang_name
         self.highlighter.set_language(lang_name)
-        self._update_completer_model()
 
     def _on_text_changed(self):
         self.is_modified = True
 
 
 class TerminalInput(QLineEdit):
-    """Поле вводу команд термінала з підтримкою історії (стрілки Вгору/Вниз)."""
+    """Поле вводу команд термінала з історією (стрілки Вгору/Вниз)."""
+
     def __init__(self, on_submit_callback):
         super().__init__()
         self.on_submit_callback = on_submit_callback
-        self.history = []
+        self.history: list[str] = []
         self.history_index = -1
+
+    def submit(self):
+        cmd = self.text().strip()
+        if not cmd:
+            return
+        if not self.history or self.history[-1] != cmd:
+            self.history.append(cmd)
+        self.history_index = len(self.history)
+        self.clear()
+        self.on_submit_callback(cmd)
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-            cmd = self.text().strip()
-            if cmd:
-                if not self.history or self.history[-1] != cmd:
-                    self.history.append(cmd)
-                self.history_index = len(self.history)
-                self.clear()
-                self.on_submit_callback(cmd)
+            self.submit()
             return
 
         if event.key() == Qt.Key_Up and self.history:
@@ -512,6 +571,10 @@ class TerminalInput(QLineEdit):
         super().keyPressEvent(event)
 
 
+# ---------------------------------------------------------------------------
+# Головне вікно
+# ---------------------------------------------------------------------------
+
 class CodeEditor(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -526,13 +589,21 @@ class CodeEditor(QMainWindow):
         self.terminal_cwd = self.workspace_dir
         self.editor_font_size = 13
 
+        # Стан запущеного процесу (код або команда термінала).
+        self.process: QProcess | None = None
+        self._proc_program = ""
+        self._cleanup_files: list[str] = []
+        self._stopped_by_user = False
+        self._dec_out = SmartDecoder(oem_encoding())
+        self._dec_err = SmartDecoder(oem_encoding())
+
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(10, 10, 10, 6)
         main_layout.setSpacing(8)
 
-        # Легка верхня панель
+        # Верхня панель
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
 
@@ -543,10 +614,10 @@ class CodeEditor(QMainWindow):
         self.btn_new.setToolTip("Створити нову вкладку (Ctrl+N)")
 
         self.btn_open = QPushButton("📂 Відкрити")
-        self.btn_open.setToolTip("Відкрити файл з комп'ютера")
+        self.btn_open.setToolTip("Відкрити файл з комп'ютера (Ctrl+O)")
 
         self.btn_save = QPushButton("💾 Зберегти")
-        self.btn_save.setToolTip("Зберегти поточний файл (Ctrl+S)")
+        self.btn_save.setToolTip("Зберегти (Ctrl+S). Зберегти як… — Ctrl+Shift+S")
 
         self.lang_selector = QComboBox()
         self.lang_selector.addItems(list(LANG_EXTENSIONS.keys()))
@@ -556,6 +627,11 @@ class CodeEditor(QMainWindow):
         self.btn_run = QPushButton("▶ Запустити")
         self.btn_run.setObjectName("runBtn")
         self.btn_run.setToolTip("Запустити код або відкрити HTML у браузері (F5)")
+
+        self.btn_stop = QPushButton("■ Стоп")
+        self.btn_stop.setObjectName("stopBtn")
+        self.btn_stop.setToolTip("Зупинити запущений процес (Ctrl+F2)")
+        self.btn_stop.setEnabled(False)
 
         self.btn_font_down = QPushButton("A-")
         self.btn_font_down.setObjectName("fontBtn")
@@ -576,6 +652,7 @@ class CodeEditor(QMainWindow):
         toolbar.addWidget(self.btn_save)
         toolbar.addWidget(self.lang_selector)
         toolbar.addWidget(self.btn_run)
+        toolbar.addWidget(self.btn_stop)
         toolbar.addStretch()
         toolbar.addWidget(self.btn_font_down)
         toolbar.addWidget(self.btn_font_up)
@@ -584,7 +661,7 @@ class CodeEditor(QMainWindow):
 
         h_splitter = QSplitter(Qt.Horizontal)
 
-        # Чиста бічна панель файлів
+        # Бічна панель файлів
         sidebar_container = QWidget()
         sidebar_layout = QVBoxLayout(sidebar_container)
         sidebar_layout.setContentsMargins(0, 0, 4, 0)
@@ -635,7 +712,7 @@ class CodeEditor(QMainWindow):
         sidebar_layout.addWidget(self.file_tree)
         h_splitter.addWidget(sidebar_container)
 
-        # Центр: редактор + компактний термінал
+        # Центр: редактор + термінал
         self.v_splitter = QSplitter(Qt.Vertical)
 
         self.tabs = QTabWidget()
@@ -650,7 +727,7 @@ class CodeEditor(QMainWindow):
         console_layout.setSpacing(5)
 
         console_top = QHBoxLayout()
-        self.console_label = QLabel("Вивід і термінал")
+        self.console_label = QLabel(f"Термінал • {self.terminal_cwd}")
         self.btn_clear = QPushButton("Очистити")
         self.btn_clear.setObjectName("ghostBtn")
         self.btn_clear.setToolTip("Очистити вивід термінала")
@@ -660,15 +737,17 @@ class CodeEditor(QMainWindow):
 
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
-        self.console.setFont(QFont("Consolas", 11))
+        self.console.setFont(mono_font(11))
         self.console.setObjectName("console")
 
         cmd_row = QHBoxLayout()
         self.prompt_badge = QLabel(">")
         self.prompt_badge.setObjectName("promptBadge")
         self.terminal_input = TerminalInput(self.run_terminal_command)
-        self.terminal_input.setFont(QFont("Consolas", 11))
-        self.terminal_input.setPlaceholderText("Введи команду та натисни Enter (наприклад: py --version або cls)...")
+        self.terminal_input.setFont(mono_font(11))
+        self.terminal_input.setPlaceholderText(
+            "Команда + Enter (напр.: python --version або cls). Якщо програма чекає input() — пиши відповідь сюди."
+        )
         self.terminal_input.setObjectName("termInput")
 
         self.btn_exec_cmd = QPushButton("Виконати")
@@ -689,13 +768,14 @@ class CodeEditor(QMainWindow):
 
         main_layout.addWidget(h_splitter)
 
-        # Рядок стану знизу з підказками та індикатором шрифту
+        # Рядок стану
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_hint_label = QLabel(
-            f"Шрифт: {self.editor_font_size} pt   •   F5 — Запуск   •   Ctrl+S — Зберегти   •   Ctrl+N — Нова вкладка"
-        )
+        self.status_enc_label = QLabel("")
+        self.status_enc_label.setObjectName("statusHint")
+        self.status_hint_label = QLabel(self._status_hint())
         self.status_hint_label.setObjectName("statusHint")
+        self.status_bar.addPermanentWidget(self.status_enc_label)
         self.status_bar.addPermanentWidget(self.status_hint_label)
 
         # Сигнали
@@ -708,11 +788,12 @@ class CodeEditor(QMainWindow):
         self.btn_open.clicked.connect(self.open_file)
         self.btn_save.clicked.connect(self.save_file)
         self.btn_run.clicked.connect(self.run_code)
+        self.btn_stop.clicked.connect(self.stop_process)
         self.btn_font_down.clicked.connect(lambda: self.change_font_size(-1))
         self.btn_font_up.clicked.connect(lambda: self.change_font_size(1))
         self.btn_clear.clicked.connect(self.console.clear)
         self.btn_toggle_term.toggled.connect(self.toggle_terminal)
-        self.btn_exec_cmd.clicked.connect(self._submit_input_button)
+        self.btn_exec_cmd.clicked.connect(self.terminal_input.submit)
         self.lang_selector.currentTextChanged.connect(self.on_language_changed)
 
         self.file_tree.doubleClicked.connect(self.on_tree_double_clicked)
@@ -720,7 +801,10 @@ class CodeEditor(QMainWindow):
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
         QShortcut(QKeySequence("F5"), self).activated.connect(self.run_code)
+        QShortcut(QKeySequence("Ctrl+F2"), self).activated.connect(self.stop_process)
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self.save_file)
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self).activated.connect(self.save_file_as)
+        QShortcut(QKeySequence("Ctrl+O"), self).activated.connect(self.open_file)
         QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(self.create_new_tab)
         QShortcut(QKeySequence("Ctrl+="), self).activated.connect(lambda: self.change_font_size(1))
         QShortcut(QKeySequence("Ctrl++"), self).activated.connect(lambda: self.change_font_size(1))
@@ -731,8 +815,13 @@ class CodeEditor(QMainWindow):
 
         self.apply_styles()
         self.create_new_tab()
-        # Після створення вкладок одразу показуємо текстові файли поточної робочої папки.
         self.open_workspace_files()
+
+    # ------------------------------------------------------------------ UI
+
+    def _status_hint(self) -> str:
+        return (f"Шрифт: {self.editor_font_size} pt   •   F5 — Запуск   •   "
+                f"Ctrl+S — Зберегти   •   Ctrl+N — Нова вкладка")
 
     def change_font_size(self, delta: int):
         new_size = max(9, min(32, self.editor_font_size + delta))
@@ -743,9 +832,7 @@ class CodeEditor(QMainWindow):
             tab = self.tabs.widget(i)
             if isinstance(tab, EditorTab):
                 tab.set_editor_font_size(self.editor_font_size)
-        self.status_hint_label.setText(
-            f"Шрифт: {self.editor_font_size} pt   •   F5 — Запуск   •   Ctrl+S — Зберегти   •   Ctrl+N — Нова вкладка"
-        )
+        self.status_hint_label.setText(self._status_hint())
 
     def toggle_terminal(self, visible: bool):
         self.console_container.setVisible(visible)
@@ -771,6 +858,11 @@ class CodeEditor(QMainWindow):
             QPushButton:hover, QComboBox:hover {
                 background-color: #252b3a;
                 border-color: #465275;
+            }
+            QPushButton:disabled {
+                color: #5b6270;
+                background-color: #171a22;
+                border-color: #232838;
             }
             QPushButton:checked {
                 background-color: #222b3d;
@@ -824,6 +916,20 @@ class CodeEditor(QMainWindow):
             }
             QPushButton#runBtn:hover {
                 background-color: #388bfd;
+            }
+            QPushButton#stopBtn {
+                background-color: #3d1b20;
+                border-color: #f85149;
+                color: #ffb3ad;
+                padding: 7px 14px;
+            }
+            QPushButton#stopBtn:hover {
+                background-color: #5a2128;
+            }
+            QPushButton#stopBtn:disabled {
+                background-color: #171a22;
+                border-color: #232838;
+                color: #5b6270;
             }
             QPushButton#execBtn {
                 background-color: #238636;
@@ -917,7 +1023,7 @@ class CodeEditor(QMainWindow):
             }
             QLabel#promptBadge {
                 color: #7ee787;
-                font-family: 'Consolas', monospace;
+                font-family: 'Consolas', 'Courier New', monospace;
                 font-size: 14px;
                 padding: 0 2px;
             }
@@ -932,14 +1038,14 @@ class CodeEditor(QMainWindow):
             }
         """)
 
+    # --------------------------------------------- Операції з файлами в дереві
+
     def _selected_item_path(self) -> str | None:
         index = self.file_tree.currentIndex()
         if not index.isValid():
             return None
         path = os.path.abspath(self.file_model.filePath(index))
-        if os.path.exists(path):
-            return path
-        return None
+        return path if os.path.exists(path) else None
 
     def _target_directory_for_creation(self) -> str:
         selected_path = self._selected_item_path()
@@ -953,6 +1059,7 @@ class CodeEditor(QMainWindow):
     def _update_open_tabs_after_rename(self, old_path: str, new_path: str):
         old_abs = os.path.abspath(old_path)
         new_abs = os.path.abspath(new_path)
+        old_norm = norm(old_abs)
 
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
@@ -960,34 +1067,27 @@ class CodeEditor(QMainWindow):
                 continue
             tab_abs = os.path.abspath(tab.file_path)
 
-            if tab_abs == old_abs:
+            if norm(tab_abs) == old_norm:
                 tab.file_path = new_abs
-                ext = os.path.splitext(new_abs)[1].lower()
-                for name, lang_ext in LANG_EXTENSIONS.items():
-                    if lang_ext == ext:
-                        tab.set_language(name)
-                        if i == self.tabs.currentIndex():
-                            self.lang_selector.blockSignals(True)
-                            self.lang_selector.setCurrentText(name)
-                            self.lang_selector.blockSignals(False)
-                        break
+                lang = detect_language(new_abs)
+                if lang:
+                    tab.set_language(lang)
+                    if i == self.tabs.currentIndex():
+                        self.lang_selector.blockSignals(True)
+                        self.lang_selector.setCurrentText(lang)
+                        self.lang_selector.blockSignals(False)
+                self.update_tab_title(i)
+            elif norm(tab_abs).startswith(old_norm + os.sep):
+                rel = tab_abs[len(old_abs) + 1:]
+                tab.file_path = os.path.join(new_abs, rel)
                 self.update_tab_title(i)
 
-            elif os.path.isdir(new_abs):
-                prefix = old_abs + os.sep
-                if tab_abs.startswith(prefix):
-                    rel = tab_abs[len(prefix):]
-                    tab.file_path = os.path.join(new_abs, rel)
-                    self.update_tab_title(i)
-
     def _close_open_tabs_for_deleted_path(self, deleted_path: str):
-        del_abs = os.path.abspath(deleted_path)
         for i in range(self.tabs.count() - 1, -1, -1):
             tab = self.tabs.widget(i)
             if not isinstance(tab, EditorTab) or not tab.file_path:
                 continue
-            tab_abs = os.path.abspath(tab.file_path)
-            if tab_abs == del_abs or tab_abs.startswith(del_abs + os.sep):
+            if path_inside(tab.file_path, deleted_path):
                 tab.is_modified = False
                 self.tabs.removeTab(i)
 
@@ -1003,10 +1103,7 @@ class CodeEditor(QMainWindow):
         old_name = os.path.basename(target_path)
         parent_dir = os.path.dirname(target_path)
         new_name, ok = QInputDialog.getText(
-            self,
-            "Перейменувати",
-            f"Нова назва для «{old_name}»:",
-            text=old_name
+            self, "Перейменувати", f"Нова назва для «{old_name}»:", text=old_name
         )
         if not ok or not new_name.strip():
             return
@@ -1014,9 +1111,12 @@ class CodeEditor(QMainWindow):
         clean_new_name = new_name.strip()
         if clean_new_name == old_name:
             return
+        if any(sep in clean_new_name for sep in ("/", "\\")):
+            QMessageBox.warning(self, "Некоректна назва", "Назва не може містити / або \\.")
+            return
 
         new_path = os.path.abspath(os.path.join(parent_dir, clean_new_name))
-        if os.path.exists(new_path):
+        if os.path.exists(new_path) and norm(new_path) != norm(target_path):
             QMessageBox.warning(self, "Назва зайнята", f"Об'єкт «{clean_new_name}» уже існує.")
             return
 
@@ -1024,7 +1124,7 @@ class CodeEditor(QMainWindow):
             os.rename(target_path, new_path)
             self._update_open_tabs_after_rename(target_path, new_path)
             self.status_bar.showMessage(f"Перейменовано в «{clean_new_name}»", 3000)
-        except Exception as e:
+        except OSError as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося перейменувати:\n{e}")
 
     def delete_selected_item(self):
@@ -1033,22 +1133,28 @@ class CodeEditor(QMainWindow):
             QMessageBox.information(self, "Видалення", "Спочатку вибери файл або папку у списку зліва.")
             return
 
+        if norm(target_path) == norm(self.workspace_dir) or not path_inside(target_path, self.workspace_dir):
+            QMessageBox.warning(self, "Видалення заборонено",
+                                "Кореневу робочу папку та елементи поза нею видаляти не можна.")
+            return
+
         item_name = os.path.basename(target_path)
         is_dir = os.path.isdir(target_path)
         kind_label = "папку з усім вмістом" if is_dir else "файл"
+        where = "У кошик" if send2trash else "НАЗАВЖДИ (кошик недоступний: pip install send2trash)"
 
         reply = QMessageBox.question(
-            self,
-            "Видалити?",
-            f"Видалити {kind_label} «{item_name}»?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            self, "Видалити?",
+            f"Видалити {kind_label} «{item_name}»?\n\nКуди: {where}.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
         if reply != QMessageBox.Yes:
             return
 
         try:
-            if is_dir:
+            if send2trash:
+                send2trash(target_path)
+            elif is_dir:
                 shutil.rmtree(target_path)
             else:
                 os.remove(target_path)
@@ -1061,46 +1167,41 @@ class CodeEditor(QMainWindow):
     def create_file_in_sidebar(self):
         target_dir = self._target_directory_for_creation()
         file_name, ok = QInputDialog.getText(
-            self,
-            "Новий файл",
-            "Ім'я файлу (наприклад: index.html, style.css, app.py):"
+            self, "Новий файл", "Ім'я файлу (наприклад: index.html, style.css, app.py):"
         )
         if not ok or not file_name.strip():
             return
 
         clean_name = file_name.strip()
         new_file_path = os.path.abspath(os.path.join(target_dir, clean_name))
-        parent_dir = os.path.dirname(new_file_path)
+        if not path_inside(new_file_path, self.workspace_dir):
+            QMessageBox.warning(self, "Некоректний шлях", "Файл має бути всередині робочої папки.")
+            return
 
         try:
-            os.makedirs(parent_dir, exist_ok=True)
-            if os.path.exists(new_file_path):
-                self.open_paths_in_tabs([new_file_path])
-                return
-
-            with open(new_file_path, "w", encoding="utf-8") as f:
-                f.write("")
-
+            os.makedirs(os.path.dirname(new_file_path), exist_ok=True)
+            if not os.path.exists(new_file_path):
+                with open(new_file_path, "w", encoding="utf-8"):
+                    pass
+                self.status_bar.showMessage(f"Створено файл {clean_name}", 3000)
             self.open_paths_in_tabs([new_file_path])
-            self.status_bar.showMessage(f"Створено файл {clean_name}", 3000)
-        except Exception as e:
+        except OSError as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося створити файл:\n{e}")
 
     def create_folder_in_sidebar(self):
         target_dir = self._target_directory_for_creation()
-        folder_name, ok = QInputDialog.getText(
-            self,
-            "Нова папка",
-            "Назва нової папки:"
-        )
+        folder_name, ok = QInputDialog.getText(self, "Нова папка", "Назва нової папки:")
         if not ok or not folder_name.strip():
             return
 
         new_folder_path = os.path.abspath(os.path.join(target_dir, folder_name.strip()))
+        if not path_inside(new_folder_path, self.workspace_dir):
+            QMessageBox.warning(self, "Некоректний шлях", "Папка має бути всередині робочої папки.")
+            return
         try:
             os.makedirs(new_folder_path, exist_ok=True)
             self.status_bar.showMessage(f"Створено папку {folder_name.strip()}", 3000)
-        except Exception as e:
+        except OSError as e:
             QMessageBox.critical(self, "Помилка", f"Не вдалося створити папку:\n{e}")
 
     def set_workspace_folder(self, folder_path: str):
@@ -1109,16 +1210,18 @@ class CodeEditor(QMainWindow):
             self.workspace_dir = abs_folder
             root_idx = self.file_model.setRootPath(abs_folder)
             self.file_tree.setRootIndex(root_idx)
-            folder_name = os.path.basename(abs_folder) or abs_folder
-            self.sidebar_label.setText(folder_name)
+            self.sidebar_label.setText(os.path.basename(abs_folder) or abs_folder)
 
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Обрати папку проєкту", self.workspace_dir)
         if folder:
             self.set_workspace_folder(folder)
-            self.terminal_cwd = os.path.abspath(folder)
-            self.console_label.setText(f"Термінал • {self.terminal_cwd}")
+            self._set_terminal_cwd(os.path.abspath(folder))
             self.open_workspace_files()
+
+    def _set_terminal_cwd(self, path: str):
+        self.terminal_cwd = path
+        self.console_label.setText(f"Термінал • {self.terminal_cwd}")
 
     def collect_workspace_text_files(self):
         """Знаходить текстові файли проєкту, пропускаючи службові та дуже великі файли."""
@@ -1126,7 +1229,6 @@ class CodeEditor(QMainWindow):
         found = []
 
         for current_dir, dir_names, file_names in os.walk(root, followlinks=False):
-            # Не заходимо в каталоги залежностей, кешів та зібраних результатів.
             dir_names[:] = sorted(
                 name for name in dir_names
                 if name.lower() not in PROJECT_IGNORED_DIRS
@@ -1153,16 +1255,21 @@ class CodeEditor(QMainWindow):
         return sorted(found, key=lambda path: os.path.relpath(path, root).lower())
 
     def open_workspace_files(self):
-        """Відкриває всі знайдені текстові файли робочої папки в окремих вкладках."""
+        """Відкриває текстові файли робочої папки (не більше MAX_AUTO_OPEN_FILES)."""
         paths = self.collect_workspace_text_files()
-        if paths:
-            self.open_paths_in_tabs(paths)
+        if not paths:
+            self.status_bar.showMessage("У папці проєкту не знайдено підтримуваних текстових файлів", 5000)
+            return
+
+        to_open = paths[:MAX_AUTO_OPEN_FILES]
+        self.open_paths_in_tabs(to_open, sync_cwd=False)
+        if len(paths) > len(to_open):
             self.status_bar.showMessage(
-                f"Відкрито файлів проєкту: {len(paths)} (службові папки та файли понад 2 МБ пропущено)",
-                6000
+                f"Відкрито {len(to_open)} із {len(paths)} файлів. Решту відкривай подвійним кліком у дереві.",
+                8000
             )
         else:
-            self.status_bar.showMessage("У папці проєкту не знайдено підтримуваних текстових файлів", 5000)
+            self.status_bar.showMessage(f"Відкрито файлів проєкту: {len(to_open)}", 5000)
 
     def on_tree_double_clicked(self, index: QModelIndex):
         if not index.isValid():
@@ -1171,68 +1278,163 @@ class CodeEditor(QMainWindow):
         if os.path.isfile(file_path):
             self.open_paths_in_tabs([file_path])
 
-    def _submit_input_button(self):
-        cmd = self.terminal_input.text().strip()
-        if cmd:
-            if not self.terminal_input.history or self.terminal_input.history[-1] != cmd:
-                self.terminal_input.history.append(cmd)
-            self.terminal_input.history_index = len(self.terminal_input.history)
-            self.terminal_input.clear()
-            self.run_terminal_command(cmd)
+    # ---------------------------------------------------------------- Термінал
+
+    def console_write(self, text: str):
+        self.console.moveCursor(QTextCursor.End)
+        self.console.insertPlainText(text)
+        self.console.moveCursor(QTextCursor.End)
+        self.console.ensureCursorVisible()
 
     def sync_terminal_cwd_with_editor(self):
+        """Терміналу вистачає папки поточного файлу; дерево файлів при цьому не перемикається."""
         editor = self.current_editor()
         if editor and editor.file_path:
             folder = os.path.dirname(os.path.abspath(editor.file_path))
             if os.path.isdir(folder):
-                self.terminal_cwd = folder
-                self.console_label.setText(f"Термінал • {self.terminal_cwd}")
-                self.set_workspace_folder(folder)
+                self._set_terminal_cwd(folder)
+
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.state() != QProcess.NotRunning
+
+    def _start_process(self, program: str, args: list[str] | None = None,
+                       native_args: str | None = None, cleanup: list[str] | None = None) -> bool:
+        if self.is_running():
+            self.console_write("[Інфо]: Уже виконується процес. Дочекайся завершення або натисни ■ Стоп.\n")
+            return False
+
+        proc = QProcess(self)
+        proc.setWorkingDirectory(self.terminal_cwd)
+
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONIOENCODING", "utf-8")
+        env.insert("PYTHONUTF8", "1")
+        env.insert("PYTHONUNBUFFERED", "1")
+        proc.setProcessEnvironment(env)
+
+        self._dec_out = SmartDecoder(oem_encoding())
+        self._dec_err = SmartDecoder(oem_encoding())
+        self._cleanup_files = list(cleanup or [])
+        self._proc_program = program
+        self._stopped_by_user = False
+
+        proc.readyReadStandardOutput.connect(lambda: self._read_output(False))
+        proc.readyReadStandardError.connect(lambda: self._read_output(True))
+        proc.finished.connect(self._on_process_finished)
+        proc.errorOccurred.connect(self._on_process_error)
+
+        self.process = proc
+        self.btn_stop.setEnabled(True)
+
+        proc.setProgram(program)
+        if native_args is not None and hasattr(proc, "setNativeArguments"):
+            proc.setNativeArguments(native_args)
+        else:
+            proc.setArguments(args or [])
+        proc.start()
+        return True
+
+    def _read_output(self, is_err: bool):
+        proc = self.process
+        if proc is None:
+            return
+        if is_err:
+            data = proc.readAllStandardError().data()
+            self.console_write(self._dec_err.decode(data))
+        else:
+            data = proc.readAllStandardOutput().data()
+            self.console_write(self._dec_out.decode(data))
+
+    def _on_process_finished(self, exit_code: int, exit_status):
+        self._read_output(False)
+        self._read_output(True)
+        self.console_write(self._dec_out.decode(b"", True) + self._dec_err.decode(b"", True))
+
+        if self._stopped_by_user:
+            self.console_write("\n[Зупинено користувачем]\n")
+        elif exit_status == QProcess.CrashExit:
+            self.console_write("\n[Процес аварійно завершився]\n")
+        else:
+            self.console_write(f"\n[Завершено, код {exit_code}]\n")
+        self._cleanup_process()
+
+    def _on_process_error(self, error):
+        if error == QProcess.FailedToStart:
+            name = os.path.basename(self._proc_program).lower()
+            if name.startswith("node"):
+                self.console_write("[Інфо]: Для запуску .js потрібен встановлений Node.js.\n")
+            else:
+                self.console_write(f"[Помилка]: не вдалося запустити «{self._proc_program}».\n")
+            self._cleanup_process()
+
+    def _cleanup_process(self):
+        for path in self._cleanup_files:
+            self._remove_quietly(path)
+        self._cleanup_files = []
+        if self.process is not None:
+            self.process.deleteLater()
+            self.process = None
+        self.btn_stop.setEnabled(False)
+
+    @staticmethod
+    def _remove_quietly(path: str):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def stop_process(self):
+        if self.is_running():
+            self._stopped_by_user = True
+            self.process.kill()
 
     def run_terminal_command(self, cmd: str):
-        self.console.appendPlainText(f"> {cmd}")
+        # Якщо процес чекає введення (наприклад, input()), відправляємо рядок у його stdin.
+        if self.is_running():
+            self.process.write((cmd + "\n").encode("utf-8"))
+            self.console_write(f"{cmd}\n")
+            return
+
+        self.console_write(f"> {cmd}\n")
 
         if cmd.lower() in ("cls", "clear"):
             self.console.clear()
             return
 
         if cmd.lower() == "cd" or cmd.lower().startswith("cd "):
-            target = cmd[2:].strip().strip('"').strip("'")
+            target = cmd[2:].strip()
+            if target.lower().startswith("/d "):
+                target = target[3:].strip()
+            target = os.path.expanduser(target.strip('"').strip("'"))
             if not target:
-                self.console.appendPlainText(self.terminal_cwd)
+                self.console_write(self.terminal_cwd + "\n")
                 return
             new_path = os.path.abspath(os.path.join(self.terminal_cwd, target))
             if os.path.isdir(new_path):
-                self.terminal_cwd = new_path
-                self.console_label.setText(f"Термінал • {self.terminal_cwd}")
-                self.set_workspace_folder(new_path)
+                self._set_terminal_cwd(new_path)
             else:
-                self.console.appendPlainText(f"Шлях не знайдено: {new_path}")
+                self.console_write(f"Шлях не знайдено: {new_path}\n")
             return
 
-        try:
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                cwd=self.terminal_cwd,
-                capture_output=True,
-                text=True,
-                timeout=20
-            )
-            if result.stdout:
-                self.console.appendPlainText(result.stdout.rstrip())
-            if result.stderr:
-                self.console.appendPlainText(result.stderr.rstrip())
-            if not result.stdout and not result.stderr:
-                self.console.appendPlainText("[Готово]")
-        except subprocess.TimeoutExpired:
-            self.console.appendPlainText("[Помилка]: Час виконання команди вичерпано (20 сек).")
-        except Exception as e:
-            self.console.appendPlainText(f"[Помилка термінала]: {e}")
+        if os.name == "nt":
+            self._start_process("cmd.exe", native_args=f'/d /s /c "{cmd}"')
+        else:
+            self._start_process("/bin/sh", ["-c", cmd])
+
+    # ------------------------------------------------------------- Вкладки
 
     def current_editor(self) -> EditorTab | None:
         widget = self.tabs.currentWidget()
         return widget if isinstance(widget, EditorTab) else None
+
+    def _refresh_status_encoding(self):
+        editor = self.current_editor()
+        if editor:
+            nl = "CRLF" if editor.newline == "\r\n" else "LF"
+            self.status_enc_label.setText(f"{editor.encoding.upper()}  •  {nl}")
+        else:
+            self.status_enc_label.setText("")
 
     def update_tab_title(self, index: int):
         editor = self.tabs.widget(index)
@@ -1241,8 +1443,7 @@ class CodeEditor(QMainWindow):
         if editor.file_path:
             name = os.path.basename(editor.file_path)
         else:
-            ext = LANG_EXTENSIONS.get(editor.lang_name, ".txt")
-            name = f"новий{ext}"
+            name = f"новий{LANG_EXTENSIONS.get(editor.lang_name, '.txt')}"
 
         if editor.is_modified:
             name += " *"
@@ -1251,44 +1452,71 @@ class CodeEditor(QMainWindow):
         if index == self.tabs.currentIndex():
             title_path = editor.file_path if editor.file_path else name
             self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {title_path}")
+            self._refresh_status_encoding()
 
-    def create_new_tab(self, checked=False, lang_name=None, file_path=None, content=""):
+    def create_new_tab(self, checked=False, lang_name=None, file_path=None, content="",
+                       encoding="utf-8", newline=None):
         if lang_name is None:
             lang_name = self.lang_selector.currentText()
-        if content is None:
-            content = ""
 
         editor = EditorTab(
             lang_name=lang_name,
             file_path=file_path,
-            content=content,
-            font_size=self.editor_font_size
+            content=content or "",
+            font_size=self.editor_font_size,
+            encoding=encoding,
+            newline=newline,
         )
         editor.is_modified = False
 
         index = self.tabs.addTab(editor, "")
-        editor.textChanged.connect(lambda _=None, ed=editor: self.update_tab_title(self.tabs.indexOf(ed)))
+        editor.textChanged.connect(lambda ed=editor: self.update_tab_title(self.tabs.indexOf(ed)))
 
         self.tabs.setCurrentIndex(index)
         self.update_tab_title(index)
+
+    def maybe_save(self, editor: EditorTab) -> bool:
+        """Питає про збереження змін. Повертає False, якщо користувач натиснув «Скасувати»."""
+        if not editor.is_modified:
+            return True
+        name = os.path.basename(editor.file_path) if editor.file_path else "новий файл"
+        box = QMessageBox.question(
+            self, "Незбережені зміни", f"Зберегти зміни у «{name}»?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save
+        )
+        if box == QMessageBox.Save:
+            return self.save_editor(editor)
+        return box == QMessageBox.Discard
 
     def close_tab(self, index: int):
         if index < 0:
             return
         editor = self.tabs.widget(index)
-        if isinstance(editor, EditorTab) and editor.is_modified:
-            reply = QMessageBox.question(
-                self,
-                "Незбережені зміни",
-                "Закрити вкладку без збереження змін?",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply == QMessageBox.No:
+        if isinstance(editor, EditorTab):
+            self.tabs.setCurrentIndex(index)
+            if not self.maybe_save(editor):
                 return
 
         self.tabs.removeTab(index)
         if self.tabs.count() == 0:
             self.create_new_tab()
+
+    def closeEvent(self, event):
+        for i in range(self.tabs.count()):
+            editor = self.tabs.widget(i)
+            if isinstance(editor, EditorTab) and editor.is_modified:
+                self.tabs.setCurrentIndex(i)
+                if not self.maybe_save(editor):
+                    event.ignore()
+                    return
+
+        if self.is_running():
+            self._stopped_by_user = True
+            self.process.kill()
+            self.process.waitForFinished(1000)
+        for path in self._cleanup_files:
+            self._remove_quietly(path)
+        event.accept()
 
     def on_tab_changed(self, index: int):
         editor = self.current_editor()
@@ -1297,6 +1525,8 @@ class CodeEditor(QMainWindow):
             self.lang_selector.setCurrentText(editor.lang_name)
             self.lang_selector.blockSignals(False)
             self.update_tab_title(index)
+        else:
+            self._refresh_status_encoding()
 
     def on_language_changed(self, lang_name: str):
         editor = self.current_editor()
@@ -1305,13 +1535,16 @@ class CodeEditor(QMainWindow):
         editor.set_language(lang_name)
         self.update_tab_title(self.tabs.currentIndex())
 
-    def open_paths_in_tabs(self, paths):
+    # ------------------------------------------------------ Відкриття / збереження
+
+    def open_paths_in_tabs(self, paths, sync_cwd: bool = True):
         for path in paths:
             abs_path = os.path.abspath(path)
+
             already_open = False
             for i in range(self.tabs.count()):
                 tab = self.tabs.widget(i)
-                if isinstance(tab, EditorTab) and tab.file_path == abs_path:
+                if isinstance(tab, EditorTab) and tab.file_path and norm(tab.file_path) == norm(abs_path):
                     self.tabs.setCurrentIndex(i)
                     already_open = True
                     break
@@ -1319,18 +1552,12 @@ class CodeEditor(QMainWindow):
                 continue
 
             try:
-                with open(abs_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except UnicodeDecodeError:
-                with open(abs_path, "r", encoding="cp1251", errors="replace") as f:
-                    content = f.read()
+                content, encoding, newline = read_text_file(abs_path)
+            except OSError as e:
+                QMessageBox.warning(self, "Не вдалося відкрити", f"{abs_path}\n\n{e}")
+                continue
 
-            ext = os.path.splitext(abs_path)[1].lower()
-            detected_lang = "Текст (.txt)"
-            for name, lang_ext in LANG_EXTENSIONS.items():
-                if lang_ext == ext:
-                    detected_lang = name
-                    break
+            detected_lang = detect_language(abs_path) or LANG_TXT
 
             curr = self.current_editor()
             if (
@@ -1340,56 +1567,103 @@ class CodeEditor(QMainWindow):
                 and not curr.is_modified
             ):
                 curr.file_path = abs_path
+                curr.encoding = encoding
+                curr.newline = newline
                 curr.set_language(detected_lang)
                 curr.blockSignals(True)
                 curr.setPlainText(content)
                 curr.blockSignals(False)
                 curr.is_modified = False
+                self.lang_selector.blockSignals(True)
                 self.lang_selector.setCurrentText(detected_lang)
+                self.lang_selector.blockSignals(False)
                 self.update_tab_title(0)
             else:
-                self.create_new_tab(lang_name=detected_lang, file_path=abs_path, content=content)
+                self.create_new_tab(lang_name=detected_lang, file_path=abs_path,
+                                    content=content, encoding=encoding, newline=newline)
 
-        self.sync_terminal_cwd_with_editor()
+        if sync_cwd:
+            self.sync_terminal_cwd_with_editor()
 
     def open_file(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Відкрити файли",
-            self.terminal_cwd,
+            self, "Відкрити файли", self.terminal_cwd,
             "Усі підтримувані файли (*.py *.html *.css *.js *.cpp *.c *.json *.txt);;Усі файли (*)"
         )
         if paths:
             self.open_paths_in_tabs(paths)
 
+    def save_editor(self, editor: EditorTab, save_as: bool = False) -> bool:
+        """Зберігає вкладку. Повертає True, якщо файл збережено."""
+        path = editor.file_path
+
+        if save_as or not path:
+            default_ext = LANG_EXTENSIONS.get(editor.lang_name, ".txt")
+            default_name = {".html": "index.html", ".css": "style.css"}.get(default_ext, f"main{default_ext}")
+            start = path or os.path.join(self.terminal_cwd, default_name)
+            chosen, _ = QFileDialog.getSaveFileName(self, "Зберегти файл", start, "Усі файли (*)")
+            if not chosen:
+                return False
+            path = os.path.abspath(chosen)
+
+        text = editor.toPlainText().replace("\n", editor.newline)
+        encoding = editor.encoding
+        try:
+            try:
+                data = text.encode(encoding)
+            except UnicodeEncodeError:
+                reply = QMessageBox.question(
+                    self, "Кодування",
+                    f"Кодування {encoding.upper()} не підтримує всі символи в тексті.\n"
+                    f"Зберегти у UTF-8?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                )
+                if reply != QMessageBox.Yes:
+                    return False
+                encoding = "utf-8"
+                data = text.encode(encoding)
+
+            with open(path, "wb") as f:
+                f.write(data)
+        except OSError as e:
+            QMessageBox.critical(self, "Помилка збереження", f"Не вдалося зберегти файл:\n{e}")
+            return False
+
+        editor.encoding = encoding
+        editor.file_path = path
+        editor.is_modified = False
+
+        if save_as:
+            lang = detect_language(path)
+            if lang and lang != editor.lang_name:
+                editor.set_language(lang)
+                if editor is self.current_editor():
+                    self.lang_selector.blockSignals(True)
+                    self.lang_selector.setCurrentText(lang)
+                    self.lang_selector.blockSignals(False)
+
+        self.update_tab_title(self.tabs.indexOf(editor))
+        self.sync_terminal_cwd_with_editor()
+        self.status_bar.showMessage(f"Збережено: {os.path.basename(path)}", 3000)
+        return True
+
     def save_file(self):
         editor = self.current_editor()
-        if not editor:
-            return
+        if editor:
+            self.save_editor(editor)
 
-        default_ext = LANG_EXTENSIONS.get(editor.lang_name, ".txt")
+    def save_file_as(self):
+        editor = self.current_editor()
+        if editor:
+            self.save_editor(editor, save_as=True)
 
-        if not editor.file_path:
-            default_name = "index.html" if default_ext == ".html" else (
-                "style.css" if default_ext == ".css" else f"main{default_ext}"
-            )
-            path, _ = QFileDialog.getSaveFileName(
-                self,
-                "Зберегти файл",
-                os.path.join(self.terminal_cwd, default_name),
-                "Усі файли (*)"
-            )
-            if not path:
-                return
-            editor.file_path = os.path.abspath(path)
+    # --------------------------------------------------------------- Запуск
 
-        with open(editor.file_path, "w", encoding="utf-8") as f:
-            f.write(editor.toPlainText())
-
-        editor.is_modified = False
-        self.update_tab_title(self.tabs.currentIndex())
-        self.sync_terminal_cwd_with_editor()
-        self.status_bar.showMessage(f"Збережено: {os.path.basename(editor.file_path)}", 3000)
+    @staticmethod
+    def python_executable() -> str:
+        if getattr(sys, "frozen", False):
+            return shutil.which("python") or shutil.which("py") or shutil.which("python3") or "python"
+        return sys.executable
 
     def run_code(self):
         editor = self.current_editor()
@@ -1403,68 +1677,51 @@ class CodeEditor(QMainWindow):
         ext = LANG_EXTENSIONS.get(editor.lang_name, ".txt")
         self.console_container.setVisible(True)
         self.btn_toggle_term.setChecked(True)
+
+        if ext in (".py", ".js") and self.is_running():
+            self.console_write("[Інфо]: Уже виконується процес. Дочекайся завершення або натисни ■ Стоп.\n")
+            return
+
         self.console.clear()
 
-        if ext == ".py":
-            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as tmp:
-                tmp.write(code)
-                tmp_path = tmp.name
-            try:
-                result = subprocess.run(
-                    [sys.executable, tmp_path],
-                    cwd=self.terminal_cwd,
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if result.stdout:
-                    self.console.appendPlainText(result.stdout.strip())
-                if result.stderr:
-                    self.console.appendPlainText(f"[Помилка]:\n{result.stderr.strip()}")
-                if not result.stdout and not result.stderr:
-                    self.console.appendPlainText("[Виконано без виводу]")
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+        if ext in (".py", ".js"):
+            cleanup: list[str] = []
+            if editor.file_path:
+                # Є файл на диску — зберігаємо і запускаємо його самого (працюють __file__ та імпорти поруч).
+                if editor.is_modified or not os.path.exists(editor.file_path):
+                    if not self.save_editor(editor):
+                        return
+                script_path = editor.file_path
+            else:
+                with tempfile.NamedTemporaryFile("w", suffix=ext, delete=False, encoding="utf-8") as tmp:
+                    tmp.write(code)
+                    script_path = tmp.name
+                cleanup.append(script_path)
+
+            self.console_write(f"▶ Запуск: {os.path.basename(editor.file_path or script_path)}\n\n")
+            if ext == ".py":
+                self._start_process(self.python_executable(), ["-u", script_path], cleanup=cleanup)
+            else:
+                self._start_process("node", [script_path], cleanup=cleanup)
 
         elif ext == ".html":
-            if editor.file_path and os.path.exists(editor.file_path):
-                if editor.is_modified:
-                    self.save_file()
-                webbrowser.open("file://" + os.path.abspath(editor.file_path))
-                self.console.appendPlainText(f"[Відкрито у браузері]: {editor.file_path}")
+            if editor.file_path:
+                if editor.is_modified and not self.save_editor(editor):
+                    return
+                webbrowser.open(Path(editor.file_path).resolve().as_uri())
+                self.console_write(f"[Відкрито у браузері]: {editor.file_path}\n")
             else:
                 with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as tmp:
                     tmp.write(code)
                     tmp_path = tmp.name
-                webbrowser.open("file://" + os.path.abspath(tmp_path))
-                self.console.appendPlainText(f"[Відкрито тимчасовий HTML у браузері]: {tmp_path}")
-
-        elif ext == ".js":
-            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as tmp:
-                tmp.write(code)
-                tmp_path = tmp.name
-            try:
-                result = subprocess.run(
-                    ["node", tmp_path],
-                    cwd=self.terminal_cwd,
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if result.stdout:
-                    self.console.appendPlainText(result.stdout.strip())
-                if result.stderr:
-                    self.console.appendPlainText(f"[Помилка Node.js]:\n{result.stderr.strip()}")
-            except FileNotFoundError:
-                self.console.appendPlainText("[Інфо]: Для запуску .js потрібен встановлений Node.js.")
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                webbrowser.open(Path(tmp_path).resolve().as_uri())
+                # Тимчасовий файл видаляємо трохи пізніше, коли браузер уже встиг його прочитати.
+                QTimer.singleShot(60_000, lambda p=tmp_path: self._remove_quietly(p))
+                self.console_write("[Відкрито тимчасовий HTML у браузері]\n")
 
         else:
-            self.console.appendPlainText(
-                f"[Інфо]: Файл {ext} готовий. Відкрий вкладку HTML і натисни F5 для перегляду в браузері."
+            self.console_write(
+                f"[Інфо]: Файл {ext} готовий. Відкрий вкладку HTML і натисни F5 для перегляду в браузері.\n"
             )
 
 
